@@ -1,0 +1,71 @@
+name: Build XV2INS 1.24 Legacy
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 legacy build
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    env:
+      QT_VERSION: 6.9.1
+      QT_ARCH: win64_msvc2022_64
+      QT_ROOT: C:\Qt\6.9.1\msvc2022_64
+
+    steps:
+      - name: Checkout build repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Qt downloader
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --no-input aqtinstall==3.2.1
+
+      - name: Install Qt 6.9.1 MSVC 2022 x64
+        shell: pwsh
+        run: |
+          python -m aqt install-qt windows desktop $env:QT_VERSION $env:QT_ARCH -O C:\Qt
+          if (-not (Test-Path "$env:QT_ROOT\bin\qmake.exe")) {
+            throw "Qt installation did not produce qmake.exe at $env:QT_ROOT"
+          }
+
+      - name: Install native dependencies with vcpkg
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:VCPKG_INSTALLATION_ROOT)) {
+            throw 'VCPKG_INSTALLATION_ROOT is unavailable on this runner.'
+          }
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install libzip:x64-windows zlib:x64-windows bzip2:x64-windows
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg failed with exit code $LASTEXITCODE" }
+
+      - name: Build pinned 1.24-compatible XV2INS
+        shell: pwsh
+        run: |
+          .\scripts\build-legacy.ps1
+
+      - name: Validate output
+        shell: pwsh
+        run: |
+          $exe = '.\dist\XV2INS-1.24-Legacy\xv2ins-1.24-legacy.exe'
+          if (-not (Test-Path $exe)) { throw 'Expected legacy executable was not generated.' }
+          $item = Get-Item $exe
+          if ($item.Length -lt 1MB) { throw "Executable is unexpectedly small: $($item.Length) bytes" }
+          Get-FileHash $exe -Algorithm SHA256 | Format-List
+          Get-ChildItem '.\dist\XV2INS-1.24-Legacy' -Recurse | Select-Object FullName, Length
+
+      - name: Upload legacy build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: XV2INS-1.24-Legacy-Windows-x64
+          path: dist/XV2INS-1.24-Legacy/**
+          if-no-files-found: error
+          retention-days: 14
