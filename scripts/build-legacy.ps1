@@ -42,6 +42,29 @@ function Clone-PinnedSource {
     }
 }
 
+function Resolve-VcpkgLibrary {
+    param(
+        [string]$LibraryDirectory,
+        [string[]]$CandidateNames,
+        [string]$FallbackPattern
+    )
+
+    foreach ($name in $CandidateNames) {
+        $candidate = Join-Path $LibraryDirectory $name
+        if (Test-Path $candidate) {
+            return (Get-Item $candidate).FullName
+        }
+    }
+
+    $fallback = Get-ChildItem -Path $LibraryDirectory -Filter $FallbackPattern -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($fallback) {
+        return $fallback.FullName
+    }
+
+    $available = (Get-ChildItem -Path $LibraryDirectory -Filter '*.lib' -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ', '
+    throw "Required vcpkg library was not found. Tried: $($CandidateNames -join ', '). Available .lib files: $available"
+}
+
 $WorkRoot = [System.IO.Path]::GetFullPath($WorkRoot)
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
 
@@ -80,26 +103,48 @@ if ([string]::IsNullOrWhiteSpace($vcpkgRoot)) {
     throw 'VCPKG_INSTALLATION_ROOT is not set.'
 }
 $vcpkgInstalled = (Join-Path $vcpkgRoot 'installed\x64-windows')
-if (-not (Test-Path (Join-Path $vcpkgInstalled 'include'))) {
+$vcpkgInclude = Join-Path $vcpkgInstalled 'include'
+$vcpkgLib = Join-Path $vcpkgInstalled 'lib'
+if (-not (Test-Path $vcpkgInclude) -or -not (Test-Path $vcpkgLib)) {
     throw "vcpkg x64-windows dependencies were not found at $vcpkgInstalled"
 }
 
+# qmake's -l name translation proved unreliable with the current vcpkg layout on
+# GitHub's Windows image. Resolve the exact import-library files and link those
+# absolute paths instead. This also fails early with a useful package listing if
+# a future vcpkg port renames one of them.
+$zipLib = Resolve-VcpkgLibrary $vcpkgLib @('zip.lib') '*zip.lib'
+$zlibLib = Resolve-VcpkgLibrary $vcpkgLib @('zlib.lib', 'zlib1.lib', 'z.lib') '*zlib*.lib'
+$bz2Lib = Resolve-VcpkgLibrary $vcpkgLib @('bz2.lib', 'bzip2.lib') '*bz*.lib'
+
+Write-Host "Resolved libzip: $zipLib"
+Write-Host "Resolved zlib:   $zlibLib"
+Write-Host "Resolved bzip2:  $bz2Lib"
+
 Write-Host 'Making the upstream qmake project portable for the GitHub runner...'
 $proPath = Join-Path $xv2InsDir 'xv2ins.pro'
-$portableVcpkg = $vcpkgInstalled.Replace('\', '/')
+$portableInclude = $vcpkgInclude.Replace('\', '/')
+$portableZipLib = $zipLib.Replace('\', '/')
+$portableZlibLib = $zlibLib.Replace('\', '/')
+$portableBz2Lib = $bz2Lib.Replace('\', '/')
 $proLines = Get-Content $proPath
 $proLines = foreach ($line in $proLines) {
     if ($line -match '^INCLUDEPATH \+= ".*vcpkg.*include"\s*$') {
-        "INCLUDEPATH += `"$portableVcpkg/include`""
+        "INCLUDEPATH += `"$portableInclude`""
     }
     elseif ($line -match '^LIBS \+= -L".*vcpkg.*lib"') {
-        "LIBS += -L`"$portableVcpkg/lib`" -lzip -lzlib -lversion -lAdvapi32 -lUser32 -lbz2"
+        "LIBS += `"$portableZipLib`" `"$portableZlibLib`" `"$portableBz2Lib`" -lversion -lAdvapi32 -lUser32"
     }
     else {
         $line
     }
 }
 Set-Content -Path $proPath -Value $proLines -Encoding UTF8
+
+$patchedPro = Get-Content -Raw $proPath
+if ($patchedPro -notmatch [regex]::Escape($portableZlibLib)) {
+    throw 'Portable qmake rewrite failed: explicit vcpkg library paths were not written to xv2ins.pro.'
+}
 
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 if (-not (Test-Path $vswhere)) { throw 'vswhere.exe was not found.' }
