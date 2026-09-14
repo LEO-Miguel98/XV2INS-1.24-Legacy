@@ -129,7 +129,14 @@ $portableZlibLib = $zlibLib.Replace('\', '/')
 $portableBz2Lib = $bz2Lib.Replace('\', '/')
 $proLines = Get-Content $proPath
 $proLines = foreach ($line in $proLines) {
-    if ($line -match '^INCLUDEPATH \+= ".*vcpkg.*include"\s*$') {
+    if ($line -match '^\s*QMAKE_POST_LINK \+= mt ') {
+        # The upstream rule expands an empty DESTDIR to /xv2ins.exe when building
+        # out-of-tree, which makes mt.exe target the root of the drive. Disable
+        # that rule here and embed the same upstream manifest explicitly after
+        # the linker has produced the real executable.
+        '    QMAKE_POST_LINK ='
+    }
+    elseif ($line -match '^INCLUDEPATH \+= ".*vcpkg.*include"\s*$') {
         "INCLUDEPATH += `"$portableInclude`""
     }
     elseif ($line -match '^LIBS \+= -L".*vcpkg.*lib"') {
@@ -144,6 +151,9 @@ Set-Content -Path $proPath -Value $proLines -Encoding UTF8
 $patchedPro = Get-Content -Raw $proPath
 if ($patchedPro -notmatch [regex]::Escape($portableZlibLib)) {
     throw 'Portable qmake rewrite failed: explicit vcpkg library paths were not written to xv2ins.pro.'
+}
+if ($patchedPro -match 'QMAKE_POST_LINK \+= mt ') {
+    throw 'Portable qmake rewrite failed: upstream manifest post-link rule is still active.'
 }
 
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -171,6 +181,22 @@ if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE" }
 
 $exe = Get-ChildItem -Path $buildDir -Recurse -Filter 'xv2ins.exe' -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $exe) { throw 'Build completed but xv2ins.exe was not found.' }
+
+# Preserve the upstream UTF-8 active-code-page manifest, but attach it to the
+# actual out-of-tree executable instead of relying on the broken DESTDIR rule.
+$manifestPath = Join-Path $xv2CommonDir 'manifest.xml'
+$windowsKitBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+$mt = Get-ChildItem -Path $windowsKitBin -Recurse -Filter 'mt.exe' -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -match '\\x64\\mt\.exe$' } |
+    Sort-Object FullName -Descending |
+    Select-Object -First 1
+if (-not $mt) {
+    throw "Windows SDK mt.exe was not found under $windowsKitBin"
+}
+
+Write-Host "Embedding upstream manifest with $($mt.FullName)..."
+& $mt.FullName -nologo -manifest $manifestPath "-outputresource:$($exe.FullName);#1"
+if ($LASTEXITCODE -ne 0) { throw "mt.exe failed with exit code $LASTEXITCODE" }
 
 $packageDir = Join-Path $OutputRoot 'XV2INS-1.24-Legacy'
 New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
